@@ -18,26 +18,46 @@ concurrency:
 jobs:
   build-release-apk:
     name: Test, Lint, Build & Verify Release APK
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Set up JDK 17 (Temurin)
-        uses: actions/setup-java@v4
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: "21"
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: "platform-tools platforms;android-36.1 build-tools;36.0.0"
+          accept-android-sdk-licenses: "true"
+          log-accepted-android-sdk-licenses: "false"
 
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
+      - name: Prepare Gradle Wrapper & debug keystore
+        run: |
+          if [ ! -f ./gradlew ]; then
+            echo "::error::Missing ./gradlew in repository root."
+            exit 1
+          fi
+          if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "::error::Missing gradle/wrapper/gradle-wrapper.jar in repository."
+            exit 1
+          fi
+          sed -i 's/\r$//' ./gradlew
+          chmod +x ./gradlew
+
+          if [ ! -f debug.keystore ] && [ -f debug.keystore.base64 ]; then
+            base64 -d debug.keystore.base64 > debug.keystore
+          fi
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: basic
 
       - name: Run unit & Robolectric tests
         run: ./gradlew testDebugUnitTest --stacktrace
@@ -83,9 +103,10 @@ jobs:
           fi
           echo "Found signed APK: ${APK_FILE}"
 
-          BUILD_TOOLS_DIR="$(find "${ANDROID_HOME}/build-tools" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n 1)"
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT}}"
+          BUILD_TOOLS_DIR="$(find "${SDK_ROOT}/build-tools" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n 1)"
           if [ -z "${BUILD_TOOLS_DIR}" ]; then
-            echo "::error::Android SDK build-tools not found under ${ANDROID_HOME}/build-tools"
+            echo "::error::Android SDK build-tools not found under ${SDK_ROOT}/build-tools"
             exit 1
           fi
 
@@ -105,7 +126,7 @@ jobs:
           ls -lh "dist/SmartLedger-LicenseStudio-release.apk"
 
       - name: Upload Release APK Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: SmartLedger-LicenseStudio-release-apk
           path: dist/SmartLedger-LicenseStudio-release.apk
@@ -113,14 +134,14 @@ jobs:
 
       - name: Create GitHub Release for version tags (v*)
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/SmartLedger-LicenseStudio-release.apk
           generate_release_notes: true
 
       - name: Upload test and lint diagnostic reports on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: build-diagnostic-reports
           path: |
