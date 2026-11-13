@@ -1,0 +1,6 @@
+{
+  "name": "مُفعّل الدفتر الذكي",
+  "description": "أداة المطور المستقلة (أوفلاين 100%) لإصدار وتوقيع وإدارة تراخيص تطبيق الدفتر الذكي باستخدام ECDSA P-256 وحفظ السجل محلياً.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

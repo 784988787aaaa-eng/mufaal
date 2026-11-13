@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">مُفعّل الدفتر الذكي</string>
+    <string name="app_subtitle">استوديو إصدار وتوقيع التراخيص المحلية</string>
+    <string name="offline_badge">أوفلاين 100% • ECDSA P-256</string>
+    <string name="tab_issue">إصدار</string>
+    <string name="tab_history">السجل</string>
+    <string name="tab_vault">الخزنة</string>
+</resources>

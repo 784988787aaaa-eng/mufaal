@@ -1,0 +1,134 @@
+name: Build & Sign Release APK
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-release-apk:
+    name: Test, Lint, Build & Verify Release APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run unit & Robolectric tests
+        run: ./gradlew testDebugUnitTest --stacktrace
+
+      - name: Run Android Lint
+        run: ./gradlew lintDebug --stacktrace
+
+      - name: Generate ephemeral random release keystore
+        run: |
+          KEYSTORE_PATH="${RUNNER_TEMP}/ephemeral-release.jks"
+          KEYSTORE_PASS="$(openssl rand -hex 16)"
+          KEY_ALIAS="smartledger-release"
+          echo "::add-mask::${KEYSTORE_PASS}"
+
+          keytool -genkeypair -v \
+            -keystore "${KEYSTORE_PATH}" \
+            -storetype JKS \
+            -keyalg RSA \
+            -keysize 2048 \
+            -sigalg SHA256withRSA \
+            -validity 10000 \
+            -alias "${KEY_ALIAS}" \
+            -storepass "${KEYSTORE_PASS}" \
+            -keypass "${KEYSTORE_PASS}" \
+            -dname "CN=SmartLedger License Studio, OU=Mobile Security, O=SmartLedger, L=Riyadh, C=SA"
+
+          {
+            echo "RELEASE_STORE_FILE=${KEYSTORE_PATH}"
+            echo "RELEASE_STORE_PASSWORD=${KEYSTORE_PASS}"
+            echo "RELEASE_KEY_ALIAS=${KEY_ALIAS}"
+            echo "RELEASE_KEY_PASSWORD=${KEYSTORE_PASS}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Build signed Release APK (R8 enabled)
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Verify APK signature (apksigner) and offline permissions (aapt2)
+        run: |
+          APK_FILE="$(find app/build/outputs/apk/release -maxdepth 2 -type f -name '*.apk' ! -name '*-unsigned.apk' | head -n 1)"
+          if [ -z "${APK_FILE}" ] || [ ! -f "${APK_FILE}" ]; then
+            echo "::error::Signed release APK not found!"
+            exit 1
+          fi
+          echo "Found signed APK: ${APK_FILE}"
+
+          BUILD_TOOLS_DIR="$(find "${ANDROID_HOME}/build-tools" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n 1)"
+          if [ -z "${BUILD_TOOLS_DIR}" ]; then
+            echo "::error::Android SDK build-tools not found under ${ANDROID_HOME}/build-tools"
+            exit 1
+          fi
+
+          echo "=== apksigner verify ==="
+          "${BUILD_TOOLS_DIR}/apksigner" verify --verbose --print-certs "${APK_FILE}"
+
+          echo "=== aapt2 dump permissions ==="
+          PERMS="$("${BUILD_TOOLS_DIR}/aapt2" dump permissions "${APK_FILE}")"
+          echo "${PERMS}"
+          if echo "${PERMS}" | grep -q "android.permission.INTERNET"; then
+            echo "::error::Forbidden android.permission.INTERNET detected in release APK!"
+            exit 1
+          fi
+
+          mkdir -p dist
+          cp "${APK_FILE}" "dist/SmartLedger-LicenseStudio-release.apk"
+          ls -lh "dist/SmartLedger-LicenseStudio-release.apk"
+
+      - name: Upload Release APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmartLedger-LicenseStudio-release-apk
+          path: dist/SmartLedger-LicenseStudio-release.apk
+          if-no-files-found: error
+
+      - name: Create GitHub Release for version tags (v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/SmartLedger-LicenseStudio-release.apk
+          generate_release_notes: true
+
+      - name: Upload test and lint diagnostic reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostic-reports
+          path: |
+            app/build/reports/tests/
+            app/build/test-results/
+            app/build/reports/lint-results*
+          if-no-files-found: ignore
+
+      - name: Clean up ephemeral keystore
+        if: always()
+        run: rm -f "${RUNNER_TEMP}/ephemeral-release.jks"
