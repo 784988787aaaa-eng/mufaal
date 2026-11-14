@@ -56,6 +56,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import com.example.crypto.EcLicenseCrypto
 import com.example.crypto.LicensePlan
 import com.example.data.IssuedLicenseEntity
 import com.example.share.LicenseShareHelper
@@ -79,7 +80,7 @@ fun LicenseResultScreen(
     var showPayloadJson by remember { mutableStateOf(false) }
 
     val saveSlicLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.CreateDocument("application/octet-stream")
+        contract = ActivityResultContracts.CreateDocument("text/plain")
     ) { uri ->
         if (uri != null && license != null) {
             runCatching {
@@ -166,18 +167,21 @@ fun LicenseResultScreen(
                             tint = if (verified) SuccessGreen else WarningAmber,
                             modifier = Modifier.size(26.dp)
                         )
+                        val parsedPayload = remember(license.token) {
+                            EcLicenseCrypto.extractPayloadUnsafe(license.token)
+                        }
                         Column {
                             Text(
                                 text = if (verified) {
-                                    "تم التحقق الذاتي بالمفتاح العام بنجاح ✓"
+                                    "تم التحقق الذاتي بالمفتاح (${parsedPayload?.kid ?: "LOCAL2"}) بنجاح ✓"
                                 } else {
-                                    "تعذر التحقق بالمفتاح الحالي (ربما تغيّر المفتاح)"
+                                    "تعذر التحقق بالمفتاح (${parsedPayload?.kid ?: "غير معروف"})"
                                 },
                                 style = MaterialTheme.typography.titleMedium,
                                 color = if (verified) SuccessGreen else WarningAmber
                             )
                             Text(
-                                text = "توقيع رقمي SHA256withECDSA (ES256 / LOCAL2)",
+                                text = "SHA256withECDSA • IEEE P1363 (64B) • v: ${parsedPayload?.v ?: 1} / ${parsedPayload?.kid ?: "LOCAL2"} • ${license.token.length} حرف",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -277,7 +281,7 @@ fun LicenseResultScreen(
                 ) {
                     Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null)
                     Spacer(Modifier.width(8.dp))
-                    Text("إرسال رسالة واتساب جاهزة للعميل")
+                    Text("إرسال عبر واتساب")
                 }
 
                 Row(
@@ -286,8 +290,8 @@ fun LicenseResultScreen(
                 ) {
                     FilledTonalButton(
                         onClick = {
-                            LicenseShareHelper.copyToClipboard(context, "SLK1 License", license.token)
-                            Toast.makeText(context, "تم نسخ كود التفعيل فقط", Toast.LENGTH_SHORT).show()
+                            LicenseShareHelper.copyToClipboard(context, "SLK1 License", license.token.trim())
+                            Toast.makeText(context, "تم نسخ كود التفعيل SLK1", Toast.LENGTH_SHORT).show()
                         },
                         shape = RoundedCornerShape(14.dp),
                         modifier = Modifier
@@ -297,7 +301,7 @@ fun LicenseResultScreen(
                     ) {
                         Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(6.dp))
-                        Text("نسخ الكود فقط")
+                        Text("نسخ كود التفعيل")
                     }
 
                     FilledTonalButton(
@@ -320,7 +324,7 @@ fun LicenseResultScreen(
                 ) {
                     OutlinedButton(
                         onClick = {
-                            LicenseShareHelper.shareSlicFile(context, license.licenseId, license.token)
+                            LicenseShareHelper.shareSlicFile(context, license.deviceCode, license.token)
                         },
                         shape = RoundedCornerShape(14.dp),
                         modifier = Modifier
@@ -330,12 +334,12 @@ fun LicenseResultScreen(
                     ) {
                         Icon(Icons.Default.Description, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(6.dp))
-                        Text("مشاركة .slic")
+                        Text("تصدير ملف .slic")
                     }
 
                     OutlinedButton(
                         onClick = {
-                            saveSlicLauncher.launch("SMARTLEDGER_${license.licenseId}.slic")
+                            saveSlicLauncher.launch(LicenseShareHelper.slicFileName(license.deviceCode))
                         },
                         shape = RoundedCornerShape(14.dp),
                         modifier = Modifier

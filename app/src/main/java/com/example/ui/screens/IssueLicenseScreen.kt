@@ -45,7 +45,6 @@ import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberDatePickerState
@@ -82,14 +81,12 @@ fun IssueLicenseScreen(
     vaultMetadata: VaultMetadata,
     onDeviceCodeChange: (String) -> Unit,
     onSmartPaste: (String?) -> Unit,
-    onCheckDigitOverrideChange: (Boolean) -> Unit,
     onPlanChange: (LicensePlan) -> Unit,
     onSelectTrialDays: (Int) -> Unit,
     onSelectCustomTrialDate: (Long) -> Unit,
     onCustomerNameChange: (String) -> Unit,
     onCustomerPhoneChange: (String) -> Unit,
     onNotesChange: (String) -> Unit,
-    onIncludeCustomerHintChange: (Boolean) -> Unit,
     onGenerateKeyQuickAction: () -> Unit,
     onOpenVaultTab: () -> Unit,
     onIssueClick: () -> Unit,
@@ -151,6 +148,32 @@ fun IssueLicenseScreen(
                                 Text("فتح الخزنة")
                             }
                         }
+                    }
+                }
+            } else if (!vaultMetadata.matchesSmartLedgerDefaultKey) {
+                Surface(
+                    color = WarningAmber.copy(alpha = 0.13f),
+                    border = BorderStroke(1.dp, WarningAmber.copy(alpha = 0.45f)),
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.WarningAmber,
+                            contentDescription = null,
+                            tint = WarningAmber,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Text(
+                            text = "تذكير: المفتاح النشط مخصّص. تأكد من تحديث license_local_ec_public.pem و FALLBACK_LOCAL_EC_PUBLIC_KEY في تطبيق الدفتر الذكي ليقبل التوقيع.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.weight(1f)
+                        )
                     }
                 }
             }
@@ -242,7 +265,7 @@ fun IssueLicenseScreen(
                         )
                     }
 
-                    // Instant Validation Pill
+                    // Instant Luhn mod-32 Validation Pill
                     if (formState.deviceCodeInput.isNotBlank()) {
                         val v = formState.validation
                         val (bg, fg, icon, msg) = when {
@@ -250,19 +273,19 @@ fun IssueLicenseScreen(
                                 SuccessGreen.copy(alpha = 0.14f),
                                 SuccessGreen,
                                 Icons.Default.CheckCircle,
-                                "الصيغة سليمة وحرف التحقق (${v.actualCheckDigit}) مطابق ✓"
+                                "الصيغة سليمة وحرف التحقق (${v.actualCheckDigit}) مطابق (Luhn mod-32) ✓"
                             )
                             v.isFormatValid && !v.isCheckDigitValid -> Quad(
                                 MaterialTheme.colorScheme.errorContainer,
                                 MaterialTheme.colorScheme.onErrorContainer,
                                 Icons.Default.ErrorOutline,
-                                "خطأ إملائي في حرف التحقق! الحرف المدخل (${v.actualCheckDigit}) والمتوقع (${v.expectedCheckDigit})"
+                                "رمز الجهاز يحوي خطأ إملائياً! حرف التحقق (${v.actualCheckDigit}) لا يطابق المتوقع (${v.expectedCheckDigit}) — الإصدار محظور."
                             )
                             else -> Quad(
                                 MaterialTheme.colorScheme.errorContainer,
                                 MaterialTheme.colorScheme.onErrorContainer,
                                 Icons.Default.ErrorOutline,
-                                "الصيغة غير مكتملة — الصيغة المطلوبة: SLD-XXXX-XXXX-XXXC"
+                                "الصيغة غير مكتملة أو تحوي أحرفاً مستبعدة (0/O/1/I) — الصيغة المطلوبة: SLD-XXXX-XXXX-XXXC"
                             )
                         }
                         Surface(
@@ -282,37 +305,6 @@ fun IssueLicenseScreen(
                                     color = fg
                                 )
                             }
-                        }
-                    }
-
-                    // Explicit Check-Digit Override (only shown if format matches but check digit mismatches)
-                    AnimatedVisibility(
-                        visible = formState.validation.isFormatValid && !formState.validation.isCheckDigitValid
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = "تجاوز فحص حرف التحقق (استثنائي فقط)",
-                                    style = MaterialTheme.typography.labelLarge,
-                                    color = WarningAmber
-                                )
-                                Text(
-                                    text = "فعّله فقط إذا كان الكود صادراً بخوارزمية تحقق مختلفة وتأكدت من صحته يدوياً.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                            Switch(
-                                checked = formState.allowCheckDigitOverride,
-                                onCheckedChange = onCheckDigitOverrideChange,
-                                modifier = Modifier.testTag("check_digit_override_switch")
-                            )
                         }
                     }
 
@@ -367,10 +359,29 @@ fun IssueLicenseScreen(
                     modifier = Modifier.padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    Text(
-                        text = "نوع خطة الترخيص",
-                        style = MaterialTheme.typography.titleMedium
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "نوع خطة الترخيص",
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                        if (formState.autoDetectedPlan != null) {
+                            Surface(
+                                color = SuccessGreen.copy(alpha = 0.14f),
+                                shape = RoundedCornerShape(50)
+                            ) {
+                                Text(
+                                    text = "مكتشف تلقائياً ✓",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = SuccessGreen,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                                )
+                            }
+                        }
+                    }
 
                     SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
                         LicensePlan.entries.forEachIndexed { index, planOption ->
@@ -426,6 +437,33 @@ fun IssueLicenseScreen(
                                     modifier = Modifier.testTag("trial_chip_custom")
                                 )
                             }
+
+                            var daysField by remember(formState.trialDurationDays, formState.customTrialEndsAtMillis) {
+                                mutableStateOf(
+                                    if (formState.customTrialEndsAtMillis == null && formState.trialDurationDays != null) {
+                                        formState.trialDurationDays.toString()
+                                    } else {
+                                        ""
+                                    }
+                                )
+                            }
+                            OutlinedTextField(
+                                value = daysField,
+                                onValueChange = { raw ->
+                                    val digits = raw.filter(Char::isDigit).take(4)
+                                    daysField = digits
+                                    val parsedDays = digits.toIntOrNull()
+                                    if (parsedDays != null && parsedDays > 0) {
+                                        onSelectTrialDays(parsedDays)
+                                    }
+                                },
+                                label = { Text("عدد الأيام (مثال: 7، 14، 30، 90)") },
+                                singleLine = true,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("trial_days_input")
+                            )
                         }
                     }
                 }
@@ -456,7 +494,7 @@ fun IssueLicenseScreen(
                                 style = MaterialTheme.typography.titleMedium
                             )
                             Text(
-                                text = "تُحفظ محلياً في سجل المطور فقط ولا تُدرج في التوقيع إلا باختيارك",
+                                text = "تُحفظ محلياً في سجل المطور فقط ولا تُدرج في حمولة SLK1 الموقّعة",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -493,28 +531,6 @@ fun IssueLicenseScreen(
                             .fillMaxWidth()
                             .testTag("customer_notes_input")
                     )
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "تضمين تلميح الاسم (customerHint)",
-                                style = MaterialTheme.typography.bodyMedium
-                            )
-                            Text(
-                                text = "اختياري — اتركه معطلاً للحمولة القياسية الصافية",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        Switch(
-                            checked = formState.includeCustomerHintInPayload,
-                            onCheckedChange = onIncludeCustomerHintChange
-                        )
-                    }
                 }
             }
 
@@ -533,7 +549,12 @@ fun IssueLicenseScreen(
                 )
                 Spacer(Modifier.width(8.dp))
                 Text(
-                    text = if (formState.isIssuing) "جاري التوقيع..." else "توقيع وإصدار الترخيص (SLK1)",
+                    text = if (formState.isIssuing) {
+                        "جاري التوقيع..."
+                    } else {
+                        val kidLabel = vaultMetadata.activeKid ?: "SLK1"
+                        "توقيع وإصدار الترخيص ($kidLabel)"
+                    },
                     style = MaterialTheme.typography.titleMedium
                 )
             }

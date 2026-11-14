@@ -34,21 +34,19 @@ import kotlinx.coroutines.withContext
 data class IssueFormState(
     val deviceCodeInput: String = "",
     val validation: DeviceCodeValidator.ValidationResult = DeviceCodeValidator.validate(""),
-    val allowCheckDigitOverride: Boolean = false,
     val plan: LicensePlan = LicensePlan.LIFETIME,
+    val autoDetectedPlan: LicensePlan? = null,
     val trialDurationDays: Int? = 14,
     val customTrialEndsAtMillis: Long? = null,
     val customerName: String = "",
     val customerPhone: String = "",
     val notes: String = "",
-    val includeCustomerHintInPayload: Boolean = false,
     val upgradingFromLicenseId: String? = null,
     val duplicateDeviceRecords: List<IssuedLicenseEntity> = emptyList(),
     val isIssuing: Boolean = false
 ) {
     val canIssue: Boolean
-        get() = validation.isFormatValid &&
-            (validation.isCheckDigitValid || allowCheckDigitOverride) &&
+        get() = validation.isFullyValid &&
             (plan == LicensePlan.LIFETIME || trialDurationDays != null || customTrialEndsAtMillis != null) &&
             !isIssuing
 }
@@ -203,33 +201,69 @@ class LicenseStudioViewModel(
 
     // --- KeyVault Management ---
 
-    fun generateKeyPair() {
+    fun generateKeyPair(kid: String? = null) {
         viewModelScope.launch {
-            val metadata = withContext(workerDispatcher) {
-                keyVault.generateNewKeyPair()
+            val outcome = runCatching {
+                withContext(workerDispatcher) {
+                    keyVault.generateNewKeyPair(kid = kid)
+                }
             }
-            _vaultMetadata.value = metadata
-            emitEvent("تم توليد زوج مفاتيح ECDSA P-256 وحفظه مشفراً داخل الخزنة")
+            outcome.onSuccess { metadata ->
+                _vaultMetadata.value = metadata
+                emitEvent("تم توليد وحفظ زوج المفاتيح (${metadata.activeKid ?: "LOCAL2"}) مشفراً داخل الخزنة")
+            }.onFailure { err ->
+                emitEvent(err.message ?: "تعذر توليد زوج المفاتيح")
+            }
         }
     }
 
     fun importKeyPairPem(
         privateKeyInput: String,
         publicKeyPem: String,
-        allowOverwrite: Boolean
+        allowOverwrite: Boolean,
+        kid: String? = null
     ): Boolean {
         return runCatching {
-            keyVault.importKeyPairPem(privateKeyInput, publicKeyPem, allowOverwrite)
+            keyVault.importKeyPairPem(privateKeyInput, publicKeyPem, allowOverwrite, kid = kid)
         }.onSuccess { metadata ->
             _vaultMetadata.value = metadata
-            emitEvent("تم استيراد المفتاح الخاص والعام وحفظهما بأمان")
+            emitEvent("تم استيراد وحفظ زوج المفاتيح (${metadata.activeKid ?: ""}) بأمان")
         }.onFailure { e ->
             emitEvent(e.message ?: "فشل استيراد المفاتيح")
         }.isSuccess
     }
 
+    fun setActiveKey(kid: String) {
+        runCatching {
+            keyVault.setActiveKey(kid)
+        }.onSuccess { metadata ->
+            _vaultMetadata.value = metadata
+            emitEvent("تم تفعيل المفتاح ${metadata.activeKid} للتوقيع")
+        }.onFailure { err ->
+            emitEvent(err.message ?: "تعذر تبديل المفتاح النشط")
+        }
+    }
+
+    fun setKeyTrustedInKeyring(kid: String, trusted: Boolean) {
+        runCatching {
+            keyVault.setKeyTrustedInKeyring(kid, trusted)
+        }.onSuccess { metadata ->
+            _vaultMetadata.value = metadata
+            emitEvent(
+                if (trusted) "تم تضمين المفتاح $kid في تصدير Keyring"
+                else "تم استبعاد المفتاح $kid من تصدير Keyring"
+            )
+        }.onFailure { err ->
+            emitEvent(err.message ?: "تعذر تعديل حالة المفتاح")
+        }
+    }
+
     fun exportPublicKeyPem(): String? {
         return runCatching { keyVault.exportPublicKeyPem() }.getOrNull()
+    }
+
+    fun exportKeyringPublicPem(): String? {
+        return runCatching { keyVault.exportKeyringPublicPem() }.getOrNull()
     }
 
     suspend fun exportEncryptedKeyBackup(password: String): Result<String> {
@@ -260,8 +294,7 @@ class LicenseStudioViewModel(
         _issueForm.update {
             it.copy(
                 deviceCodeInput = normalized,
-                validation = validation,
-                allowCheckDigitOverride = if (validation.isCheckDigitValid) false else it.allowCheckDigitOverride
+                validation = validation
             )
         }
         checkDuplicateDevice(validation.normalizedCode)
@@ -272,30 +305,43 @@ class LicenseStudioViewModel(
             emitEvent("الحافظة فارغة")
             return false
         }
-        val extracted = DeviceCodeValidator.extractFromText(clipboardText)
+        val parsed = DeviceCodeValidator.parseActivationRequest(clipboardText)
+        val detectedPlan = parsed.detectedPlan
+        if (detectedPlan != null) {
+            _issueForm.update { state ->
+                state.copy(
+                    plan = detectedPlan,
+                    autoDetectedPlan = detectedPlan,
+                    trialDurationDays = if (detectedPlan == LicensePlan.TRIAL && state.trialDurationDays == null && state.customTrialEndsAtMillis == null) 14 else state.trialDurationDays
+                )
+            }
+        }
+        val extracted = parsed.deviceCode
         return if (extracted != null) {
             updateDeviceCode(extracted)
             val validation = DeviceCodeValidator.validate(extracted)
+            val planNote = detectedPlan?.let { " • الخطة: ${it.arabicLabel}" } ?: ""
             if (validation.isCheckDigitValid) {
-                emitEvent("تم استخراج كود الجهاز والتحقق منه: $extracted")
+                emitEvent("تم استخراج رمز الجهاز والتحقق منه: $extracted$planNote")
             } else {
-                emitEvent("تم استخراج $extracted — تنبيه: حرف التحقق غير مطابق!")
+                emitEvent("تم استخراج $extracted — خطأ إملائي في حرف التحقق!$planNote")
             }
             true
         } else {
-            emitEvent("لم يتم العثور على كود جهاز بصيغة SLD-XXXX-XXXX-XXXC في النص")
+            if (detectedPlan != null) {
+                emitEvent("تم ضبط الخطة (${detectedPlan.arabicLabel}) — لم يُعثر على رمز جهاز بصيغة SLD-XXXX-XXXX-XXXC")
+            } else {
+                emitEvent("لم يتم العثور على رمز جهاز بصيغة SLD-XXXX-XXXX-XXXC في النص")
+            }
             false
         }
-    }
-
-    fun setCheckDigitOverride(allow: Boolean) {
-        _issueForm.update { it.copy(allowCheckDigitOverride = allow) }
     }
 
     fun setPlan(plan: LicensePlan) {
         _issueForm.update { state ->
             state.copy(
                 plan = plan,
+                autoDetectedPlan = null,
                 trialDurationDays = if (plan == LicensePlan.TRIAL && state.trialDurationDays == null && state.customTrialEndsAtMillis == null) 14 else state.trialDurationDays
             )
         }
@@ -333,10 +379,6 @@ class LicenseStudioViewModel(
         _issueForm.update { it.copy(notes = value) }
     }
 
-    fun setIncludeCustomerHint(include: Boolean) {
-        _issueForm.update { it.copy(includeCustomerHintInPayload = include) }
-    }
-
     fun resetIssueForm() {
         _issueForm.value = IssueFormState()
     }
@@ -346,7 +388,6 @@ class LicenseStudioViewModel(
         _issueForm.value = IssueFormState(
             deviceCodeInput = validation.normalizedCode,
             validation = validation,
-            allowCheckDigitOverride = !validation.isCheckDigitValid,
             plan = LicensePlan.LIFETIME,
             customerName = existing.customerName,
             customerPhone = existing.customerPhone,
@@ -373,12 +414,13 @@ class LicenseStudioViewModel(
 
     fun issueAndSignLicense(onIssued: (IssuedLicenseEntity) -> Unit) {
         val current = _issueForm.value
-        if (!_vaultMetadata.value.hasKeyPair) {
+        val activeKid = _vaultMetadata.value.activeKid
+        if (!_vaultMetadata.value.hasKeyPair || activeKid == null) {
             emitEvent("يرجى توليد أو استيراد مفتاح التوقيع من الخزنة أولاً")
             return
         }
         if (!current.canIssue) {
-            emitEvent("تحقق من صحة كود الجهاز وخيارات الخطة أولاً")
+            emitEvent("تحقق من صحة رمز الجهاز وخيارات الخطة أولاً")
             return
         }
 
@@ -386,14 +428,14 @@ class LicenseStudioViewModel(
         viewModelScope.launch {
             val outcome = runCatching {
                 val now = System.currentTimeMillis()
-                val hint = if (current.includeCustomerHintInPayload) current.customerName else null
                 val payload = EcLicenseCrypto.buildPayload(
                     deviceCode = current.validation.normalizedCode,
                     plan = current.plan,
+                    kid = activeKid,
                     issuedAtMillis = now,
                     trialDays = current.trialDurationDays,
                     customTrialEndsAtMillis = current.customTrialEndsAtMillis,
-                    customerHint = hint
+                    nowMillis = now
                 )
                 val signed = withContext(workerDispatcher) {
                     keyVault.signLicense(payload)

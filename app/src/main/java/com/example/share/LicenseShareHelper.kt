@@ -46,34 +46,15 @@ object LicenseShareHelper {
     }
 
     fun buildWhatsAppActivationMessage(license: IssuedLicenseEntity): String {
-        val planEnum = LicensePlan.fromWireName(license.plan)
-        val greeting = if (license.customerName.isNotBlank()) {
-            "مرحباً ${license.customerName.trim()}،"
-        } else {
-            "مرحباً،"
-        }
-        val planText = when (planEnum) {
-            LicensePlan.LIFETIME -> "ترخيص دائم (مدى الحياة)"
-            LicensePlan.TRIAL -> {
-                val endText = license.expiresAt?.let { formatDateTime(it) } ?: "محددة"
-                "ترخيص فترة تجريبية (ساري حتى: $endText)"
-            }
+        val planLabel = when (LicensePlan.fromWireName(license.plan)) {
+            LicensePlan.LIFETIME -> "مدى الحياة"
+            LicensePlan.TRIAL -> "تجريبي"
         }
         return buildString {
-            appendLine(greeting)
-            appendLine("تم إصدار كود التفعيل الخاص بتطبيق *الدفتر الذكي*:")
-            appendLine()
-            appendLine("• نوع الخطة: $planText")
-            appendLine("• كود الجهاز: `${license.deviceCode}`")
-            appendLine("• رقم الترخيص: `${license.licenseId}`")
-            appendLine()
-            appendLine("*خطوات التفعيل داخل التطبيق:*")
-            appendLine("1) افتح تطبيق الدفتر الذكي ← الإعدادات ← التفعيل.")
-            appendLine("2) انسخ كود التفعيل التالي كاملاً والصقه في خانة التفعيل (أو استورد ملف `.slic` / امسح رمز QR).")
-            appendLine("3) اضغط على *تفعيل الآن* (يعمل بدون إنترنت).")
-            appendLine()
+            appendLine("تم إصدار ترخيص الدفتر الذكي ($planLabel)")
+            appendLine("رمز الجهاز: ${license.deviceCode}")
             appendLine("كود التفعيل:")
-            append(license.token)
+            append(license.token.trim())
         }
     }
 
@@ -106,27 +87,37 @@ object LicenseShareHelper {
         context.startActivity(chooser)
     }
 
-    fun shareSlicFile(context: Context, licenseId: String, token: String) {
+    fun slicFileName(deviceCode: String): String {
+        val safeCode = DeviceCodeValidator.normalizeInput(deviceCode)
+            .ifBlank { "SMARTLEDGER" }
+        return "license_${safeCode}.slic"
+    }
+
+    fun shareSlicFile(context: Context, deviceCode: String, token: String) {
         val dir = ensureExportsDir(context)
-        val file = File(dir, "SMARTLEDGER_${licenseId}.slic")
-        file.writeText(token, StandardCharsets.UTF_8)
+        val file = File(dir, slicFileName(deviceCode))
+        file.writeText(token.trim(), StandardCharsets.UTF_8)
         shareFileUri(
             context = context,
             file = file,
-            mimeType = "application/octet-stream",
-            chooserTitle = "مشاركة ملف الترخيص (.slic)"
+            mimeType = "text/plain",
+            chooserTitle = "تصدير ملف ترخيص (.slic)"
         )
     }
 
-    fun sharePublicKeyPemFile(context: Context, publicKeyPem: String) {
+    fun sharePublicKeyPemFile(
+        context: Context,
+        publicKeyPem: String,
+        fileName: String = "license_local_ec_public.pem"
+    ) {
         val dir = ensureExportsDir(context)
-        val file = File(dir, "license_local_ec_public.pem")
+        val file = File(dir, fileName)
         file.writeText(publicKeyPem, StandardCharsets.UTF_8)
         shareFileUri(
             context = context,
             file = file,
             mimeType = "application/x-pem-file",
-            chooserTitle = "مشاركة المفتاح العام (license_local_ec_public.pem)"
+            chooserTitle = "مشاركة المفتاح العام ($fileName)"
         )
     }
 

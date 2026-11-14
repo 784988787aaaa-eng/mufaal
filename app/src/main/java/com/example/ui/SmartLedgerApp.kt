@@ -198,7 +198,7 @@ private fun UnlockedStudioShell(
                                 )
                                 Text(
                                     text = if (vaultMetadata.hasKeyPair) {
-                                        "مفتاح LOCAL2 نشط • أوفلاين"
+                                        "مفتاح ${vaultMetadata.activeKid ?: "LOCAL2"} نشط • أوفلاين"
                                     } else {
                                         "الخزنة بانتظار توليد المفتاح"
                                     },
@@ -287,15 +287,13 @@ private fun UnlockedStudioShell(
                             vaultMetadata = vaultMetadata,
                             onDeviceCodeChange = viewModel::updateDeviceCode,
                             onSmartPaste = viewModel::smartPasteFromText,
-                            onCheckDigitOverrideChange = viewModel::setCheckDigitOverride,
                             onPlanChange = viewModel::setPlan,
                             onSelectTrialDays = viewModel::selectTrialDays,
                             onSelectCustomTrialDate = viewModel::selectCustomTrialDate,
                             onCustomerNameChange = viewModel::updateCustomerName,
                             onCustomerPhoneChange = viewModel::updateCustomerPhone,
                             onNotesChange = viewModel::updateNotes,
-                            onIncludeCustomerHintChange = viewModel::setIncludeCustomerHint,
-                            onGenerateKeyQuickAction = viewModel::generateKeyPair,
+                            onGenerateKeyQuickAction = { viewModel.generateKeyPair() },
                             onOpenVaultTab = { navigateToTopLevel(AppRoute.Vault) },
                             onIssueClick = {
                                 viewModel.issueAndSignLicense { issued ->
@@ -336,6 +334,9 @@ private fun UnlockedStudioShell(
                             onToggleTheme = viewModel::toggleTheme,
                             onGenerateKeyPair = viewModel::generateKeyPair,
                             onImportKeyPairPem = viewModel::importKeyPairPem,
+                            onSetActiveKey = viewModel::setActiveKey,
+                            onSetKeyTrustedInKeyring = viewModel::setKeyTrustedInKeyring,
+                            onExportKeyringPublicPem = viewModel::exportKeyringPublicPem,
                             onExportEncryptedKeyBackup = viewModel::exportEncryptedKeyBackup,
                             onRestoreEncryptedKeyBackup = viewModel::restoreEncryptedKeyBackup,
                             onSetBiometricEnabled = viewModel::setBiometricEnabled,

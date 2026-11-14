@@ -3,22 +3,27 @@ package com.example.crypto
 import java.util.Locale
 
 /**
- * Validator, extractor, and check-digit engine for SmartLedger device codes.
+ * Validator, extractor, and Luhn mod-32 check-character engine for SmartLedger device codes.
  *
  * Canonical format: `SLD-XXXX-XXXX-XXXC`
  * - Prefix: `SLD`
- * - Payload characters: 11 alphanumeric characters (`0-9`, `A-Z`)
- * - Check digit (`C`): 12th alphanumeric character computed via weighted Luhn-mod-36
+ * - Alphabet (32 chars, excluding 0 / O / 1 / I): `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`
+ * - Check character (`C`): 12th character computed via Luhn mod-32 over the first 11 characters.
  */
 object DeviceCodeValidator {
 
-    private const val ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    private const val RADIX = ALPHABET.length // 36
+    const val ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    private const val RADIX = 32
 
-    private val STRICT_REGEX = Regex("^SLD-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$")
+    private val INVISIBLE_CHARS_REGEX =
+        Regex("[\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF]")
+    private val MULTI_WHITESPACE_REGEX = Regex("\\s+")
+
+    private val STRICT_REGEX =
+        Regex("^SLD-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$")
+
     private val EXTRACT_REGEX = Regex(
-        pattern = """SLD[\s\-–—_]*([A-Za-z0-9٠-٩]{4})[\s\-–—_]*([A-Za-z0-9٠-٩]{4})[\s\-–—_]*([A-Za-z0-9٠-٩]{4})""",
-        options = setOf(RegexOption.IGNORE_CASE)
+        pattern = """SLD[\s\-]*([A-HJ-NP-Z2-9]{4})[\s\-]*([A-HJ-NP-Z2-9]{4})[\s\-]*([A-HJ-NP-Z2-9]{4})"""
     )
 
     data class ValidationResult(
@@ -31,47 +36,78 @@ object DeviceCodeValidator {
         val isFullyValid: Boolean get() = isFormatValid && isCheckDigitValid
     }
 
+    data class ParsedActivationRequest(
+        val deviceCode: String?,
+        val detectedPlan: LicensePlan?
+    )
+
     /**
-     * Normalizes raw user input (trims RTL/LTR marks, converts Eastern Arabic digits,
-     * normalizes dashes, uppercases).
+     * Strips invisible Unicode control characters, normalizes dashes, collapses extra spaces,
+     * and converts ASCII letters to UPPERCASE.
+     */
+    fun cleanMessageText(raw: String): String {
+        return raw
+            .replace(INVISIBLE_CHARS_REGEX, "")
+            .replace("–", "-")
+            .replace("—", "-")
+            .replace("−", "-")
+            .replace(MULTI_WHITESPACE_REGEX, " ")
+            .trim()
+    }
+
+    /**
+     * Normalizes device code input (removes invisible Unicode characters, normalizes dashes,
+     * trims spaces, uppercases).
      */
     fun normalizeInput(raw: String): String {
-        val cleaned = raw
-            .replace("\u200F", "")
-            .replace("\u200E", "")
-            .replace("\u202A", "")
-            .replace("\u202B", "")
-            .replace("\u202C", "")
+        return raw
+            .replace(INVISIBLE_CHARS_REGEX, "")
             .replace("–", "-")
             .replace("—", "-")
             .replace("−", "-")
             .trim()
-        val sb = StringBuilder(cleaned.length)
-        for (ch in cleaned) {
-            sb.append(
-                when (ch) {
-                    in '٠'..'٩' -> ('0'.code + (ch.code - '٠'.code)).toChar()
-                    in '۰'..'۹' -> ('0'.code + (ch.code - '۰'.code)).toChar()
-                    else -> ch
-                }
-            )
-        }
-        return sb.toString().uppercase(Locale.US)
+            .replace(MULTI_WHITESPACE_REGEX, "")
+            .uppercase(Locale.US)
     }
 
     /**
-     * Extracts a `SLD-XXXX-XXXX-XXXC` device code from arbitrary text (such as a full WhatsApp message).
+     * Extracts a `SLD-XXXX-XXXX-XXXC` device code from arbitrary text (such as a full WhatsApp request).
      * Returns null if no matching device code pattern is found.
      */
     fun extractFromText(rawMessage: String): String? {
-        val normalized = normalizeInput(rawMessage)
-        val match = EXTRACT_REGEX.find(normalized) ?: return null
+        val cleaned = cleanMessageText(rawMessage).uppercase(Locale.US)
+        val match = EXTRACT_REGEX.find(cleaned) ?: return null
         val (g1, g2, g3) = match.destructured
         return "SLD-$g1-$g2-$g3"
     }
 
     /**
-     * Validates both canonical format and the trailing check digit.
+     * Detects the requested license plan from a SmartLedger WhatsApp activation request message.
+     */
+    fun detectPlanFromText(rawMessage: String): LicensePlan? {
+        val cleaned = cleanMessageText(rawMessage)
+        val upper = cleaned.uppercase(Locale.US)
+        return when {
+            cleaned.contains("مؤقت") || cleaned.contains("تجريبي") || upper.contains("TRIAL") ->
+                LicensePlan.TRIAL
+            cleaned.contains("دائم") || cleaned.contains("مدى الحياة") || upper.contains("LIFETIME") ->
+                LicensePlan.LIFETIME
+            else -> null
+        }
+    }
+
+    /**
+     * Parses both the device code and the requested plan from a pasted activation request.
+     */
+    fun parseActivationRequest(rawMessage: String): ParsedActivationRequest {
+        return ParsedActivationRequest(
+            deviceCode = extractFromText(rawMessage),
+            detectedPlan = detectPlanFromText(rawMessage)
+        )
+    }
+
+    /**
+     * Validates both canonical format (`SLD-[A-HJ-NP-Z2-9]{4}-...`) and the Luhn mod-32 check character.
      */
     fun validate(rawInput: String): ValidationResult {
         val normalized = normalizeInput(rawInput)
@@ -83,9 +119,9 @@ object DeviceCodeValidator {
             )
         }
         val compact = normalized.removePrefix("SLD-").replace("-", "") // 12 chars
-        val body11 = compact.substring(0, 11)
+        val elevenChars = compact.substring(0, 11)
         val actualCheck = compact[11]
-        val expectedCheck = computeCheckDigit(body11)
+        val expectedCheck = computeCheckDigit(elevenChars)
         return ValidationResult(
             normalizedCode = normalized,
             isFormatValid = true,
@@ -96,31 +132,34 @@ object DeviceCodeValidator {
     }
 
     /**
-     * Computes Luhn-mod-36 check digit over the 11 alphanumeric payload characters.
+     * Computes Luhn mod-32 check character over the first 11 characters (`indices 0..10`).
      */
-    fun computeCheckDigit(body11: String): Char {
-        require(body11.length == 11) { "Body must be exactly 11 characters, got ${body11.length}" }
+    fun computeCheckDigit(elevenChars: String): Char {
+        require(elevenChars.length == 11) {
+            "Expected exactly 11 characters, got ${elevenChars.length}"
+        }
         var factor = 2
         var sum = 0
-        for (i in body11.length - 1 downTo 0) {
-            val codePoint = ALPHABET.indexOf(body11[i])
-            require(codePoint >= 0) { "Unsupported character '${body11[i]}' in device code" }
+        for (i in 10 downTo 0) {
+            val codePoint = ALPHABET.indexOf(elevenChars[i])
+            require(codePoint >= 0) {
+                "Unsupported character '${elevenChars[i]}' in device code"
+            }
             var addend = factor * codePoint
             factor = if (factor == 2) 1 else 2
             addend = (addend / RADIX) + (addend % RADIX)
             sum += addend
         }
-        val remainder = sum % RADIX
-        val checkCodePoint = (RADIX - remainder) % RADIX
+        val checkCodePoint = (RADIX - (sum % RADIX)) % RADIX
         return ALPHABET[checkCodePoint]
     }
 
     /**
-     * Helper to build a valid formatted device code from 11 alphanumeric characters.
+     * Helper to build a valid formatted `SLD-XXXX-XXXX-XXXC` device code from 11 valid alphabet chars.
      */
-    fun buildValidCode(body11: String): String {
-        val upper = normalizeInput(body11).replace("-", "")
-        require(upper.length == 11) { "Expected 11 alphanumeric characters" }
+    fun buildValidCode(elevenChars: String): String {
+        val upper = normalizeInput(elevenChars).replace("-", "")
+        require(upper.length == 11) { "Expected 11 valid alphabet characters" }
         val check = computeCheckDigit(upper)
         val full = upper + check
         return "SLD-${full.substring(0, 4)}-${full.substring(4, 8)}-${full.substring(8, 12)}"

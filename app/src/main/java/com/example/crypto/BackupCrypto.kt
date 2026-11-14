@@ -49,11 +49,25 @@ object BackupCrypto {
     )
 
     @Serializable
-    data class KeyPairBackupPayload(
+    data class KeyringBackupItem(
+        val kid: String,
         val privateKeyPkcs8B64: String,
         val publicKeyPem: String,
         val fingerprintSha256: String,
-        val createdAt: Long
+        val keySource: String = "GENERATED",
+        val createdAt: Long,
+        val isActive: Boolean = false,
+        val isTrustedInKeyring: Boolean = true
+    )
+
+    @Serializable
+    data class KeyPairBackupPayload(
+        val privateKeyPkcs8B64: String = "",
+        val publicKeyPem: String = "",
+        val fingerprintSha256: String = "",
+        val createdAt: Long = 0L,
+        val kid: String = EcLicenseCrypto.EXPECTED_KEY_ID,
+        val keys: List<KeyringBackupItem> = emptyList()
     )
 
     fun isPasswordStrong(password: String): Boolean {

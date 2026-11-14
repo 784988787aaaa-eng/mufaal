@@ -8,12 +8,10 @@ import com.example.crypto.BackupCrypto
 import com.example.crypto.EcLicenseCrypto
 import com.example.crypto.LicensePayload
 import com.example.crypto.SignedLicenseResult
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
-import java.security.PrivateKey
-import java.security.PublicKey
 import java.security.SecureRandom
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.PBEKeySpec
@@ -87,54 +85,94 @@ enum class KeySource(val arabicLabel: String) {
     IMPORTED("مستورد بشكل آمن")
 }
 
+data class KeySummary(
+    val kid: String,
+    val publicKeyPem: String,
+    val fingerprintSha256: String,
+    val keySource: KeySource,
+    val createdAt: Long,
+    val isActive: Boolean,
+    val isTrustedInKeyring: Boolean,
+    val matchesSmartLedgerDefaultKey: Boolean
+)
+
 data class VaultMetadata(
     val hasKeyPair: Boolean,
-    val publicKeyPem: String?,
-    val fingerprintSha256: String?,
-    val keySource: KeySource?,
-    val keyCreatedAt: Long?,
-    val isPinConfigured: Boolean,
-    val isBiometricEnabled: Boolean
-)
+    val activeKid: String? = null,
+    val publicKeyPem: String? = null,
+    val fingerprintSha256: String? = null,
+    val matchesSmartLedgerDefaultKey: Boolean = false,
+    val keySource: KeySource? = null,
+    val keyCreatedAt: Long? = null,
+    val isPinConfigured: Boolean = false,
+    val isBiometricEnabled: Boolean = false,
+    val keys: List<KeySummary> = emptyList(),
+    val suggestedNextKid: String = EcLicenseCrypto.EXPECTED_KEY_ID
+) {
+    val trustedKeyCount: Int get() = keys.count { it.isTrustedInKeyring }
+}
 
 /**
  * Hardware-backed KeyVault managing:
  * 1) Developer PIN lock (salted PBKDF2-HMAC-SHA256) + Biometric preference
- * 2) ECDSA P-256 (secp256r1) signing keypair stored encrypted via Android Keystore MasterKey
- * 3) One-way signing (private key never exposed to UI or plain backups)
- * 4) Password-encrypted private key export/import (AES-256-GCM + PBKDF2)
+ * 2) Multi-key ECDSA P-256 (secp256r1) Keyring with Key ID (`LOCAL2`, `LOCAL3`, ...) & Key Rotation
+ * 3) One-way signing (private keys never leave the vault in plain exports)
+ * 4) X.509 PEM export (Active single PEM, Keyring `# kid: ...` PEM, or `<kid>.pem`)
+ * 5) Password-encrypted keyring backup/restore (AES-256-GCM + PBKDF2 `.slkey`)
  */
 class KeyVault(private val storage: VaultStorage) {
+
+    @Serializable
+    private data class StoredKeyEntry(
+        val kid: String,
+        val privateKeyPkcs8B64: String,
+        val publicKeyPem: String,
+        val keySource: String,
+        val createdAt: Long,
+        val isActive: Boolean,
+        val isTrustedInKeyring: Boolean = true
+    )
 
     private val secureRandom = SecureRandom()
     private val json = Json { ignoreUnknownKeys = true }
 
     fun getMetadata(): VaultMetadata {
-        val pubPem = storage.getString(KEY_PUBLIC_PEM)
-        val privB64 = storage.getString(KEY_PRIVATE_PKCS8)
-        val hasPair = !pubPem.isNullOrBlank() && !privB64.isNullOrBlank()
-        val fingerprint = if (hasPair) {
-            runCatching {
-                val pub = EcLicenseCrypto.decodePublicKeyPem(pubPem!!)
+        val entries = loadKeyring()
+        val summaries = entries.mapNotNull { entry ->
+            val fingerprint = runCatching {
+                val pub = EcLicenseCrypto.decodePublicKeyPem(entry.publicKeyPem)
                 EcLicenseCrypto.publicKeyFingerprintSha256(pub)
-            }.getOrNull()
-        } else null
+            }.getOrNull() ?: return@mapNotNull null
 
-        val source = storage.getString(KEY_SOURCE)?.let { raw ->
-            KeySource.entries.firstOrNull { it.name == raw }
+            val source = KeySource.entries.firstOrNull { it.name == entry.keySource } ?: KeySource.GENERATED
+            KeySummary(
+                kid = entry.kid,
+                publicKeyPem = entry.publicKeyPem,
+                fingerprintSha256 = fingerprint,
+                keySource = source,
+                createdAt = entry.createdAt,
+                isActive = entry.isActive,
+                isTrustedInKeyring = entry.isTrustedInKeyring,
+                matchesSmartLedgerDefaultKey = EcLicenseCrypto.matchesSmartLedgerDefaultKey(entry.publicKeyPem)
+            )
         }
-        val createdAt = storage.getString(KEY_CREATED_AT)?.toLongOrNull()
+
+        val active = summaries.firstOrNull { it.isActive } ?: summaries.firstOrNull()
         val pinConfigured = !storage.getString(KEY_PIN_HASH).isNullOrBlank()
         val biometricEnabled = storage.getBoolean(KEY_BIOMETRIC_ENABLED, false)
 
         return VaultMetadata(
-            hasKeyPair = hasPair,
-            publicKeyPem = if (hasPair) pubPem else null,
-            fingerprintSha256 = fingerprint,
-            keySource = source,
-            keyCreatedAt = createdAt,
+            hasKeyPair = active != null,
+            activeKid = active?.kid,
+            publicKeyPem = active?.publicKeyPem,
+            fingerprintSha256 = active?.fingerprintSha256,
+            matchesSmartLedgerDefaultKey = active?.matchesSmartLedgerDefaultKey == true,
+            keySource = active?.keySource,
+            keyCreatedAt = active?.createdAt,
             isPinConfigured = pinConfigured,
-            isBiometricEnabled = biometricEnabled
+            isBiometricEnabled = biometricEnabled,
+            keys = summaries,
+            suggestedNextKid = EcLicenseCrypto.suggestNextKeyId(summaries.map { it.kid })
         )
     }
 
@@ -167,65 +205,168 @@ class KeyVault(private val storage: VaultStorage) {
 
     fun isBiometricEnabled(): Boolean = storage.getBoolean(KEY_BIOMETRIC_ENABLED, false)
 
-    fun generateNewKeyPair(nowMillis: Long = System.currentTimeMillis()): VaultMetadata {
+    fun generateNewKeyPair(
+        kid: String? = null,
+        nowMillis: Long = System.currentTimeMillis()
+    ): VaultMetadata {
+        val existing = loadKeyring()
+        val targetKid = EcLicenseCrypto.normalizeKeyId(
+            kid ?: EcLicenseCrypto.suggestNextKeyId(existing.map { it.kid })
+        )
+        require(EcLicenseCrypto.isValidKeyId(targetKid)) {
+            "معرّف المفتاح ($targetKid) غير صالح! يجب أن يطابق ^LOCAL[A-Z0-9_-]{1,24}$ ويُمنع استخدام LOCAL1."
+        }
+        require(existing.none { it.kid == targetKid }) {
+            "معرّف المفتاح $targetKid موجود مسبقاً في السجل. اختر معرّفاً جديداً للتدوير (مثل ${EcLicenseCrypto.suggestNextKeyId(existing.map { it.kid })})."
+        }
+
         val pair = EcLicenseCrypto.generateEcP256KeyPair()
         val privB64 = EcLicenseCrypto.encodePrivateKeyPkcs8Base64(pair.private)
         val pubPem = EcLicenseCrypto.encodePublicKeyPem(pair.public)
-        storage.putString(KEY_PRIVATE_PKCS8, privB64)
-        storage.putString(KEY_PUBLIC_PEM, pubPem)
-        storage.putString(KEY_SOURCE, KeySource.GENERATED.name)
-        storage.putString(KEY_CREATED_AT, nowMillis.toString())
+
+        val updated = existing.map { it.copy(isActive = false) } + StoredKeyEntry(
+            kid = targetKid,
+            privateKeyPkcs8B64 = privB64,
+            publicKeyPem = pubPem,
+            keySource = KeySource.GENERATED.name,
+            createdAt = nowMillis,
+            isActive = true,
+            isTrustedInKeyring = true
+        )
+        saveKeyring(updated)
         return getMetadata()
     }
 
-    /**
-     * Imports a matching ECDSA P-256 private + public keypair securely into the vault.
-     * Validates that the keys are valid EC keys and match each other before persisting.
-     */
     fun importKeyPairPem(
         privateKeyPemOrB64: String,
         publicKeyPem: String,
         allowOverwrite: Boolean,
+        kid: String? = null,
         nowMillis: Long = System.currentTimeMillis()
     ): VaultMetadata {
-        val current = getMetadata()
-        require(!current.hasKeyPair || allowOverwrite) {
-            "يوجد زوج مفاتيح مخزن بالفعل. فعّل خيار الاستبدال الصريح للمتابعة."
+        val existing = loadKeyring()
+        val targetKid = EcLicenseCrypto.normalizeKeyId(
+            kid ?: if (existing.isEmpty()) EcLicenseCrypto.EXPECTED_KEY_ID else EcLicenseCrypto.suggestNextKeyId(existing.map { it.kid })
+        )
+        require(EcLicenseCrypto.isValidKeyId(targetKid)) {
+            "معرّف المفتاح ($targetKid) غير صالح! يجب أن يطابق ^LOCAL[A-Z0-9_-]{1,24}$ ويُمنع استخدام LOCAL1."
         }
+        val duplicateIndex = existing.indexOfFirst { it.kid == targetKid }
+        require(duplicateIndex < 0 || allowOverwrite) {
+            "معرّف المفتاح $targetKid موجود بالفعل. فعّل خيار الاستبدال أو استخدم معرّفاً جديداً."
+        }
+
         val privateKey = EcLicenseCrypto.decodePrivateKey(privateKeyPemOrB64)
         val publicKey = EcLicenseCrypto.decodePublicKeyPem(publicKeyPem)
         require(EcLicenseCrypto.verifyKeyPairMatch(privateKey, publicKey)) {
             "المفتاح الخاص لا يطابق المفتاح العام المرفق!"
         }
-        storage.putString(KEY_PRIVATE_PKCS8, EcLicenseCrypto.encodePrivateKeyPkcs8Base64(privateKey))
-        storage.putString(KEY_PUBLIC_PEM, EcLicenseCrypto.encodePublicKeyPem(publicKey))
-        storage.putString(KEY_SOURCE, KeySource.IMPORTED.name)
-        storage.putString(KEY_CREATED_AT, nowMillis.toString())
+
+        val newEntry = StoredKeyEntry(
+            kid = targetKid,
+            privateKeyPkcs8B64 = EcLicenseCrypto.encodePrivateKeyPkcs8Base64(privateKey),
+            publicKeyPem = EcLicenseCrypto.encodePublicKeyPem(publicKey),
+            keySource = KeySource.IMPORTED.name,
+            createdAt = nowMillis,
+            isActive = true,
+            isTrustedInKeyring = true
+        )
+
+        val updated = existing
+            .filterNot { it.kid == targetKid }
+            .map { it.copy(isActive = false) } + newEntry
+        saveKeyring(updated)
+        return getMetadata()
+    }
+
+    fun setActiveKey(kid: String): VaultMetadata {
+        val normalizedKid = EcLicenseCrypto.normalizeKeyId(kid)
+        val existing = loadKeyring()
+        require(existing.any { it.kid == normalizedKid }) {
+            "المفتاح $normalizedKid غير موجود في سجل المفاتيح"
+        }
+        val updated = existing.map { entry ->
+            if (entry.kid == normalizedKid) {
+                entry.copy(isActive = true, isTrustedInKeyring = true)
+            } else {
+                entry.copy(isActive = false)
+            }
+        }
+        saveKeyring(updated)
+        return getMetadata()
+    }
+
+    fun setKeyTrustedInKeyring(kid: String, trusted: Boolean): VaultMetadata {
+        val normalizedKid = EcLicenseCrypto.normalizeKeyId(kid)
+        val existing = loadKeyring()
+        val target = existing.firstOrNull { it.kid == normalizedKid }
+            ?: error("المفتاح $normalizedKid غير موجود في سجل المفاتيح")
+        require(!target.isActive || trusted) {
+            "لا يمكن إلغاء اعتماد المفتاح النشط حالياً ($normalizedKid). فعّل مفتاحاً آخر أولاً."
+        }
+        val updated = existing.map { entry ->
+            if (entry.kid == normalizedKid) entry.copy(isTrustedInKeyring = trusted) else entry
+        }
+        saveKeyring(updated)
         return getMetadata()
     }
 
     fun exportPublicKeyPem(): String {
-        return storage.getString(KEY_PUBLIC_PEM)
+        val entries = loadKeyring()
+        val active = entries.firstOrNull { it.isActive } ?: entries.firstOrNull()
+        return active?.publicKeyPem
             ?: error("لا يوجد مفتاح عام مخزن بعد. يرجى توليد زوج المفاتيح أولاً.")
     }
 
+    fun exportPublicKeyPemByKid(kid: String): String {
+        val normalizedKid = EcLicenseCrypto.normalizeKeyId(kid)
+        val entries = loadKeyring()
+        return entries.firstOrNull { it.kid == normalizedKid }?.publicKeyPem
+            ?: error("لم يتم العثور على المفتاح $normalizedKid")
+    }
+
+    fun exportKeyringPublicPem(): String {
+        val trusted = loadKeyring().filter { it.isTrustedInKeyring || it.isActive }
+        require(trusted.isNotEmpty()) {
+            "لا توجد مفاتيح عامة معتمدة للتصدير"
+        }
+        return EcLicenseCrypto.formatKeyringPem(trusted.map { it.kid to it.publicKeyPem })
+    }
+
     /**
-     * Exports the private key ONLY inside a password-encrypted AES-256-GCM + PBKDF2 envelope.
+     * Exports the full Keyring (private + public keys + metadata) ONLY inside a password-encrypted
+     * AES-256-GCM + PBKDF2 envelope.
      */
     fun exportEncryptedKeyPairBackup(
         password: String,
         nowMillis: Long = System.currentTimeMillis()
     ): String {
-        val privB64 = storage.getString(KEY_PRIVATE_PKCS8)
-            ?: error("لا يوجد مفتاح خاص لتصديره")
-        val pubPem = storage.getString(KEY_PUBLIC_PEM)
-            ?: error("لا يوجد مفتاح عام لتصديره")
-        val pubKey = EcLicenseCrypto.decodePublicKeyPem(pubPem)
+        val entries = loadKeyring()
+        require(entries.isNotEmpty()) { "لا يوجد أي زوج مفاتيح لتصديره" }
+        val active = entries.firstOrNull { it.isActive } ?: entries.first()
+        val activePub = EcLicenseCrypto.decodePublicKeyPem(active.publicKeyPem)
+
+        val backupItems = entries.map { entry ->
+            val pub = EcLicenseCrypto.decodePublicKeyPem(entry.publicKeyPem)
+            BackupCrypto.KeyringBackupItem(
+                kid = entry.kid,
+                privateKeyPkcs8B64 = entry.privateKeyPkcs8B64,
+                publicKeyPem = entry.publicKeyPem,
+                fingerprintSha256 = EcLicenseCrypto.publicKeyFingerprintSha256(pub),
+                keySource = entry.keySource,
+                createdAt = entry.createdAt,
+                isActive = entry.isActive,
+                isTrustedInKeyring = entry.isTrustedInKeyring
+            )
+        }
+
         val payload = BackupCrypto.KeyPairBackupPayload(
-            privateKeyPkcs8B64 = privB64,
-            publicKeyPem = pubPem,
-            fingerprintSha256 = EcLicenseCrypto.publicKeyFingerprintSha256(pubKey),
-            createdAt = nowMillis
+            privateKeyPkcs8B64 = active.privateKeyPkcs8B64,
+            publicKeyPem = active.publicKeyPem,
+            fingerprintSha256 = EcLicenseCrypto.publicKeyFingerprintSha256(activePub),
+            createdAt = nowMillis,
+            kid = active.kid,
+            keys = backupItems
         )
         val payloadJson = json.encodeToString(payload)
         return BackupCrypto.encrypt(
@@ -242,9 +383,9 @@ class KeyVault(private val storage: VaultStorage) {
         allowOverwrite: Boolean,
         nowMillis: Long = System.currentTimeMillis()
     ): VaultMetadata {
-        val current = getMetadata()
-        require(!current.hasKeyPair || allowOverwrite) {
-            "يوجد زوج مفاتيح مخزن بالفعل. فعّل خيار الاستبدال الصريح للمتابعة."
+        val existing = loadKeyring()
+        require(existing.isEmpty() || allowOverwrite) {
+            "يوجد مفاتيح مخزنة بالفعل. فعّل خيار الاستبدال الصريح للمتابعة."
         }
         val decrypted = BackupCrypto.decrypt(
             envelopeJson = encryptedEnvelopeJson,
@@ -252,34 +393,116 @@ class KeyVault(private val storage: VaultStorage) {
             expectedType = BackupCrypto.TYPE_PRIVATE_KEY
         )
         val payload = json.decodeFromString<BackupCrypto.KeyPairBackupPayload>(decrypted)
-        return importKeyPairPem(
-            privateKeyPemOrB64 = payload.privateKeyPkcs8B64,
-            publicKeyPem = payload.publicKeyPem,
-            allowOverwrite = allowOverwrite,
-            nowMillis = nowMillis
-        )
+        if (payload.keys.isEmpty()) {
+            return importKeyPairPem(
+                privateKeyPemOrB64 = payload.privateKeyPkcs8B64,
+                publicKeyPem = payload.publicKeyPem,
+                allowOverwrite = allowOverwrite,
+                kid = payload.kid,
+                nowMillis = nowMillis
+            )
+        }
+
+        val restoredEntries = payload.keys.map { item ->
+            val normalizedKid = EcLicenseCrypto.normalizeKeyId(item.kid)
+            require(EcLicenseCrypto.isValidKeyId(normalizedKid)) {
+                "معرّف المفتاح في النسخة الاحتياطية غير صالح: $normalizedKid"
+            }
+            val priv = EcLicenseCrypto.decodePrivateKey(item.privateKeyPkcs8B64)
+            val pub = EcLicenseCrypto.decodePublicKeyPem(item.publicKeyPem)
+            require(EcLicenseCrypto.verifyKeyPairMatch(priv, pub)) {
+                "المفتاح الخاص لا يطابق العام للمعرف $normalizedKid"
+            }
+            StoredKeyEntry(
+                kid = normalizedKid,
+                privateKeyPkcs8B64 = EcLicenseCrypto.encodePrivateKeyPkcs8Base64(priv),
+                publicKeyPem = EcLicenseCrypto.encodePublicKeyPem(pub),
+                keySource = item.keySource,
+                createdAt = item.createdAt,
+                isActive = item.isActive,
+                isTrustedInKeyring = item.isTrustedInKeyring
+            )
+        }.let { list ->
+            if (list.any { it.isActive }) list else list.mapIndexed { idx, e -> e.copy(isActive = idx == list.lastIndex) }
+        }
+        saveKeyring(restoredEntries)
+        return getMetadata()
     }
 
     /**
-     * Signs a canonical [LicensePayload] inside the vault and immediately self-verifies it.
+     * Signs a canonical [LicensePayload] inside the vault using the key matching `payload.kid`
+     * (or the active key) and immediately self-verifies it with the corresponding public key.
      */
     fun signLicense(payload: LicensePayload): SignedLicenseResult {
-        val (privateKey, publicKey) = loadKeyPair()
+        val entries = loadKeyring()
+        val matching = entries.firstOrNull { it.kid == payload.kid }
+            ?: entries.firstOrNull { it.isActive }
+            ?: error("لم يتم إعداد مفتاح التوقيع الخاص في الخزنة بعد")
+        require(matching.kid == payload.kid) {
+            "المفتاح المطلوب (${payload.kid}) لا يطابق المفتاح النشط (${matching.kid})"
+        }
+        val privateKey = EcLicenseCrypto.decodePrivateKey(matching.privateKeyPkcs8B64)
+        val publicKey = EcLicenseCrypto.decodePublicKeyPem(matching.publicKeyPem)
         return EcLicenseCrypto.issueAndSign(payload, privateKey, publicKey)
     }
 
+    /**
+     * Verifies a token by matching its payload `kid` against the stored public key in the keyring.
+     */
     fun verifyTokenWithVaultKey(token: String): Boolean {
-        val pubPem = storage.getString(KEY_PUBLIC_PEM) ?: return false
-        val publicKey = EcLicenseCrypto.decodePublicKeyPem(pubPem)
-        return EcLicenseCrypto.verifyToken(token, publicKey) != null
+        val entries = loadKeyring()
+        if (entries.isEmpty()) return false
+        val tokenKid = EcLicenseCrypto.extractPayloadUnsafe(token)?.kid
+        val candidates = if (tokenKid != null) {
+            val exact = entries.filter { it.kid == EcLicenseCrypto.normalizeKeyId(tokenKid) }
+            if (exact.isNotEmpty()) exact else entries
+        } else {
+            entries
+        }
+        return candidates.any { entry ->
+            runCatching {
+                val publicKey = EcLicenseCrypto.decodePublicKeyPem(entry.publicKeyPem)
+                EcLicenseCrypto.verifyToken(token, publicKey) != null
+            }.getOrDefault(false)
+        }
     }
 
-    private fun loadKeyPair(): Pair<PrivateKey, PublicKey> {
+    private fun loadKeyring(): List<StoredKeyEntry> {
+        val rawJson = storage.getString(KEY_KEYRING_JSON)
+        if (!rawJson.isNullOrBlank()) {
+            val parsed = runCatching { json.decodeFromString<List<StoredKeyEntry>>(rawJson) }.getOrNull()
+            if (parsed != null) return parsed
+        }
+        // Seamless migration from legacy single-key storage
         val privB64 = storage.getString(KEY_PRIVATE_PKCS8)
-            ?: error("لم يتم إعداد مفتاح التوقيع الخاص في الخزنة بعد")
         val pubPem = storage.getString(KEY_PUBLIC_PEM)
-            ?: error("لم يتم إعداد المفتاح العام في الخزنة بعد")
-        return EcLicenseCrypto.decodePrivateKey(privB64) to EcLicenseCrypto.decodePublicKeyPem(pubPem)
+        if (!privB64.isNullOrBlank() && !pubPem.isNullOrBlank()) {
+            val migrated = listOf(
+                StoredKeyEntry(
+                    kid = EcLicenseCrypto.EXPECTED_KEY_ID,
+                    privateKeyPkcs8B64 = privB64,
+                    publicKeyPem = pubPem,
+                    keySource = storage.getString(KEY_SOURCE) ?: KeySource.GENERATED.name,
+                    createdAt = storage.getString(KEY_CREATED_AT)?.toLongOrNull() ?: System.currentTimeMillis(),
+                    isActive = true,
+                    isTrustedInKeyring = true
+                )
+            )
+            saveKeyring(migrated)
+            return migrated
+        }
+        return emptyList()
+    }
+
+    private fun saveKeyring(entries: List<StoredKeyEntry>) {
+        storage.putString(KEY_KEYRING_JSON, json.encodeToString(entries))
+        val active = entries.firstOrNull { it.isActive } ?: entries.firstOrNull()
+        if (active != null) {
+            storage.putString(KEY_PRIVATE_PKCS8, active.privateKeyPkcs8B64)
+            storage.putString(KEY_PUBLIC_PEM, active.publicKeyPem)
+            storage.putString(KEY_SOURCE, active.keySource)
+            storage.putString(KEY_CREATED_AT, active.createdAt.toString())
+        }
     }
 
     private fun hashPin(pin: String, salt: ByteArray): ByteArray {
@@ -292,6 +515,7 @@ class KeyVault(private val storage: VaultStorage) {
 
     companion object {
         private const val PIN_PBKDF2_ITERATIONS = 100_000
+        private const val KEY_KEYRING_JSON = "ec_p256_keyring_json_v1"
         private const val KEY_PRIVATE_PKCS8 = "ec_p256_private_pkcs8_b64"
         private const val KEY_PUBLIC_PEM = "ec_p256_public_pem"
         private const val KEY_SOURCE = "ec_key_source"

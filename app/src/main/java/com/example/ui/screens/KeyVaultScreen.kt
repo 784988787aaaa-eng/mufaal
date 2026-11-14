@@ -20,35 +20,31 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CloudOff
-import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Password
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Upload
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.Checkbox
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -61,12 +57,8 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.gateway.GatewayCapability
@@ -75,9 +67,15 @@ import com.example.share.LicenseShareHelper
 import com.example.ui.components.MonospaceCodeBox
 import com.example.ui.components.OfflineSecurityBadge
 import com.example.ui.components.PasswordBackupDialog
-import com.example.ui.theme.CryptoMonoFamily
+import com.example.ui.theme.SuccessGreen
+import com.example.ui.theme.WarningAmber
 import kotlinx.coroutines.launch
 import java.nio.charset.StandardCharsets
+
+private enum class PublicExportMode {
+    ACTIVE_SINGLE,
+    KEYRING_ROTATION
+}
 
 @Composable
 fun KeyVaultScreen(
@@ -86,8 +84,11 @@ fun KeyVaultScreen(
     biometricAvailable: Boolean,
     isDarkTheme: Boolean,
     onToggleTheme: () -> Unit,
-    onGenerateKeyPair: () -> Unit,
-    onImportKeyPairPem: (privPem: String, pubPem: String, allowOverwrite: Boolean) -> Boolean,
+    onGenerateKeyPair: (String?) -> Unit,
+    onImportKeyPairPem: (privPem: String, pubPem: String, allowOverwrite: Boolean, kid: String?) -> Boolean,
+    onSetActiveKey: (String) -> Unit,
+    onSetKeyTrustedInKeyring: (String, Boolean) -> Unit,
+    onExportKeyringPublicPem: () -> String?,
     onExportEncryptedKeyBackup: suspend (String) -> Result<String>,
     onRestoreEncryptedKeyBackup: suspend (String, String, Boolean) -> Result<VaultMetadata>,
     onSetBiometricEnabled: (Boolean) -> Unit,
@@ -98,9 +99,11 @@ fun KeyVaultScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    var showGenerateConfirm by remember { mutableStateOf(false) }
+    var exportMode by remember { mutableStateOf(PublicExportMode.ACTIVE_SINGLE) }
+    var showGenerateDialog by remember { mutableStateOf(false) }
     var showImportPemDialog by remember { mutableStateOf(false) }
     var showExportKeyBackupDialog by remember { mutableStateOf(false) }
+    var pendingPublicPemToSave by remember { mutableStateOf<Pair<String, String>?>(null) }
     var pendingKeyBackupContent by remember { mutableStateOf<String?>(null) }
     var pendingRestoreKeyJson by remember { mutableStateOf<String?>(null) }
     var showChangePinDialog by remember { mutableStateOf(false) }
@@ -108,14 +111,17 @@ fun KeyVaultScreen(
     val savePublicPemLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/x-pem-file")
     ) { uri ->
-        val pem = metadata.publicKeyPem
+        val pending = pendingPublicPemToSave
+        pendingPublicPemToSave = null
+        val pem = pending?.second ?: metadata.publicKeyPem
+        val label = pending?.first ?: "license_local_ec_public.pem"
         if (uri != null && pem != null) {
             runCatching {
                 context.contentResolver.openOutputStream(uri)?.use { out ->
                     out.write(pem.toByteArray(StandardCharsets.UTF_8))
                 }
             }.onSuccess {
-                Toast.makeText(context, "تم حفظ license_local_ec_public.pem", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "تم حفظ $label بنجاح", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -131,7 +137,7 @@ fun KeyVaultScreen(
                     out.write(content.toByteArray(StandardCharsets.UTF_8))
                 }
             }.onSuccess {
-                Toast.makeText(context, "تم حفظ النسخة المشفرة للمفتاح الخاص (.slkey)", Toast.LENGTH_LONG).show()
+                Toast.makeText(context, "تم حفظ النسخة المشفرة للخزنة (.slkey)", Toast.LENGTH_LONG).show()
             }
         }
     }
@@ -152,6 +158,10 @@ fun KeyVaultScreen(
         }
     }
 
+    val keyringPem = remember(metadata.keys) {
+        if (metadata.hasKeyPair) onExportKeyringPublicPem() else null
+    }
+
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -167,7 +177,7 @@ fun KeyVaultScreen(
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(140.dp)
+                    .height(148.dp)
                     .clip(RoundedCornerShape(20.dp))
             ) {
                 Image(
@@ -183,7 +193,7 @@ fun KeyVaultScreen(
                             Brush.verticalGradient(
                                 listOf(
                                     Color.Black.copy(alpha = 0.25f),
-                                    MaterialTheme.colorScheme.surface.copy(alpha = 0.92f)
+                                    MaterialTheme.colorScheme.surface.copy(alpha = 0.94f)
                                 )
                             )
                         )
@@ -222,14 +232,14 @@ fun KeyVaultScreen(
                         )
                         Column {
                             Text(
-                                text = "خزنة التوقيع المشفرة (KeyVault)",
+                                text = "خزنة التوقيع وتدوير المفاتيح (KeyVault)",
                                 style = MaterialTheme.typography.titleLarge
                             )
                             Text(
                                 text = if (metadata.hasKeyPair) {
-                                    "ECDSA P-256 (secp256r1) • معرف المفتاح: LOCAL2 • ${metadata.keySource?.arabicLabel ?: ""}"
+                                    "النشط: ${metadata.activeKid ?: "LOCAL2"} • عدد المفاتيح: ${metadata.keys.size} (معتمد: ${metadata.trustedKeyCount})"
                                 } else {
-                                    "لم يتم إعداد زوج مفاتيح التوقيع بعد"
+                                    "ECDSA P-256 (secp256r1) • لم يتم إنشاء مفتاح توقيع بعد"
                                 },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -239,7 +249,7 @@ fun KeyVaultScreen(
                 }
             }
 
-            // Public Key PEM Export Card (Always shareable for SmartLedger assets/)
+            // Public Key Export Card (Single active vs Full Keyring for SmartLedger assets/)
             Card(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                 border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
@@ -250,83 +260,189 @@ fun KeyVaultScreen(
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Text(
-                        text = "تصدير المفتاح العام للتطبيق (license_local_ec_public.pem)",
+                        text = "تصدير المفتاح العام لتطبيق الدفتر الذكي (assets/)",
                         style = MaterialTheme.typography.titleMedium
                     )
                     Text(
-                        text = "انقل هذا الملف إلى مجلد assets/ في تطبيق الدفتر الذكي. لا يحتوي على المفتاح الخاص مطلقاً.",
+                        text = "يُصدر المفتاح العام بترميز X.509 PEM فقط لوضعه في assets/license_local_ec_public.pem (أو assets/license_local_keys/<kid>.pem). لا يحتوي على أي مفتاح خاص.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
 
                     if (metadata.hasKeyPair && metadata.fingerprintSha256 != null && metadata.publicKeyPem != null) {
-                        Text(
-                            text = "بصمة المفتاح العام (SHA-256 Fingerprint):",
-                            style = MaterialTheme.typography.labelLarge,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                        MonospaceCodeBox(
-                            text = metadata.fingerprintSha256,
-                            onCopy = {
-                                LicenseShareHelper.copyToClipboard(
-                                    context,
-                                    "SHA-256 Fingerprint",
-                                    metadata.fingerprintSha256
-                                )
-                                Toast.makeText(context, "تم نسخ بصمة SHA-256", Toast.LENGTH_SHORT).show()
-                            }
-                        )
-
-                        Text(
-                            text = "المفتاح العام PEM:",
-                            style = MaterialTheme.typography.labelLarge
-                        )
-                        MonospaceCodeBox(
-                            text = metadata.publicKeyPem.trim(),
-                            maxLines = 6,
-                            onCopy = {
-                                LicenseShareHelper.copyToClipboard(
-                                    context,
-                                    "Public Key PEM",
-                                    metadata.publicKeyPem
-                                )
-                                Toast.makeText(context, "تم نسخ المفتاح العام PEM", Toast.LENGTH_SHORT).show()
-                            }
-                        )
-
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Button(
-                                onClick = {
-                                    LicenseShareHelper.sharePublicKeyPemFile(context, metadata.publicKeyPem)
-                                },
+                            FilterChip(
+                                selected = exportMode == PublicExportMode.ACTIVE_SINGLE,
+                                onClick = { exportMode = PublicExportMode.ACTIVE_SINGLE },
+                                label = { Text("المفتاح النشط (${metadata.activeKid})") },
                                 modifier = Modifier
                                     .weight(1f)
-                                    .testTag("share_public_pem_button")
+                                    .testTag("export_mode_single_chip")
+                            )
+                            FilterChip(
+                                selected = exportMode == PublicExportMode.KEYRING_ROTATION,
+                                onClick = { exportMode = PublicExportMode.KEYRING_ROTATION },
+                                label = { Text("التصدير الشامل Keyring (${metadata.trustedKeyCount})") },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("export_mode_keyring_chip")
+                            )
+                        }
+
+                        if (exportMode == PublicExportMode.ACTIVE_SINGLE) {
+                            val matchesAppKey = metadata.matchesSmartLedgerDefaultKey
+                            Surface(
+                                color = if (matchesAppKey) SuccessGreen.copy(alpha = 0.14f) else WarningAmber.copy(alpha = 0.14f),
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (matchesAppKey) SuccessGreen.copy(alpha = 0.45f) else WarningAmber.copy(alpha = 0.45f)
+                                ),
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier.fillMaxWidth()
                             ) {
-                                Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(18.dp))
-                                Spacer(Modifier.width(6.dp))
-                                Text("مشاركة PEM")
+                                Text(
+                                    text = if (matchesAppKey) {
+                                        "✓ المفتاح النشط (${metadata.activeKid}) مطابق للمفتاح المدمج في الدفتر الذكي."
+                                    } else {
+                                        "⚠ المفتاح النشط (${metadata.activeKid}) جديد: استبدل assets/license_local_ec_public.pem (أو استخدم التصدير الشامل Keyring أدناه للحفاظ على التراخيص السابقة) وحدّث FALLBACK في LicenseCrypto.kt."
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (matchesAppKey) SuccessGreen else WarningAmber,
+                                    modifier = Modifier.padding(10.dp)
+                                )
                             }
 
-                            OutlinedButton(
-                                onClick = {
-                                    savePublicPemLauncher.launch("license_local_ec_public.pem")
-                                },
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .testTag("save_public_pem_button")
+                            Text(
+                                text = "بصمة SHA-256 للمفتاح النشط (${metadata.activeKid}):",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            MonospaceCodeBox(
+                                text = metadata.fingerprintSha256,
+                                onCopy = {
+                                    LicenseShareHelper.copyToClipboard(
+                                        context,
+                                        "SHA-256 Fingerprint",
+                                        metadata.fingerprintSha256
+                                    )
+                                    Toast.makeText(context, "تم نسخ بصمة SHA-256", Toast.LENGTH_SHORT).show()
+                                }
+                            )
+
+                            Text(
+                                text = "محتوى license_local_ec_public.pem (${metadata.activeKid}):",
+                                style = MaterialTheme.typography.labelLarge
+                            )
+                            MonospaceCodeBox(
+                                text = metadata.publicKeyPem.trim(),
+                                maxLines = 6,
+                                onCopy = {
+                                    LicenseShareHelper.copyToClipboard(
+                                        context,
+                                        "Public Key PEM",
+                                        metadata.publicKeyPem
+                                    )
+                                    Toast.makeText(context, "تم نسخ المفتاح العام PEM", Toast.LENGTH_SHORT).show()
+                                }
+                            )
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
-                                Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(18.dp))
-                                Spacer(Modifier.width(6.dp))
-                                Text("حفظ الملف")
+                                Button(
+                                    onClick = {
+                                        LicenseShareHelper.sharePublicKeyPemFile(context, metadata.publicKeyPem)
+                                    },
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .testTag("share_public_pem_button")
+                                ) {
+                                    Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("مشاركة PEM")
+                                }
+
+                                OutlinedButton(
+                                    onClick = {
+                                        pendingPublicPemToSave = "license_local_ec_public.pem" to metadata.publicKeyPem
+                                        savePublicPemLauncher.launch("license_local_ec_public.pem")
+                                    },
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .testTag("save_public_pem_button")
+                                ) {
+                                    Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("حفظ الملف")
+                                }
+                            }
+                        } else {
+                            val exportText = keyringPem ?: metadata.publicKeyPem
+                            Surface(
+                                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.25f),
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.4f)),
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(
+                                    text = "يحتوي هذا التصدير على جميع المفاتيح المعتمدة (${metadata.trustedKeyCount}) مسبوقة بوسم # kid: <ID> لتضمينها مباشرة في license_local_ec_public.pem ودعم التراخيص القديمة والجديدة معاً.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    modifier = Modifier.padding(10.dp)
+                                )
+                            }
+
+                            MonospaceCodeBox(
+                                text = exportText.trim(),
+                                maxLines = 8,
+                                onCopy = {
+                                    LicenseShareHelper.copyToClipboard(context, "Keyring PEM", exportText)
+                                    Toast.makeText(context, "تم نسخ Keyring PEM الشامل", Toast.LENGTH_SHORT).show()
+                                }
+                            )
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Button(
+                                    onClick = {
+                                        LicenseShareHelper.sharePublicKeyPemFile(
+                                            context = context,
+                                            publicKeyPem = exportText,
+                                            fileName = "license_local_ec_public.pem"
+                                        )
+                                    },
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .testTag("share_keyring_pem_button")
+                                ) {
+                                    Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("مشاركة Keyring")
+                                }
+                                OutlinedButton(
+                                    onClick = {
+                                        pendingPublicPemToSave = "license_local_ec_public.pem" to exportText
+                                        savePublicPemLauncher.launch("license_local_ec_public.pem")
+                                    },
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .testTag("save_keyring_pem_button")
+                                ) {
+                                    Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("حفظ Keyring")
+                                }
                             }
                         }
                     } else {
                         Text(
-                            text = "قم بتوليد زوج المفاتيح أولاً ليظهر المفتاح العام وبصمته.",
+                            text = "قم بتوليد أول زوج مفاتيح (${metadata.suggestedNextKid}) ليظهر المفتاح العام وبصمته وخيارات التصدير.",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -334,7 +450,7 @@ fun KeyVaultScreen(
                 }
             }
 
-            // Private Key Management (Protected)
+            // Keyring & Key Rotation Management Card
             Card(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                 border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
@@ -350,29 +466,66 @@ fun KeyVaultScreen(
                     ) {
                         Icon(Icons.Default.Key, contentDescription = null, tint = MaterialTheme.colorScheme.secondary)
                         Text(
-                            text = "إدارة المفتاح الخاص (محمي بـ Android Keystore)",
+                            text = "سجل وتدوير المفاتيح الخاصة (Android Keystore)",
                             style = MaterialTheme.typography.titleMedium
                         )
                     }
                     Text(
-                        text = "المفتاح الخاص محفوظ مشفراً ولا يغادر الخزنة أبداً في النسخ العادية. يُسمح بتصديره فقط داخل نسخة احتياطية مشفرة بكلمة مرور قوية (AES-GCM + PBKDF2).",
+                        text = "المفاتيح الخاصة محفوظة مشفرة داخل الخزنة ولا تغادر الجهاز إلا ضمن نسخة .slkey مشفرة بكلمة مرور (AES-256-GCM). يُمنع استخدام المعرف المحجوز LOCAL1.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
 
                     Button(
-                        onClick = {
-                            if (metadata.hasKeyPair) {
-                                showGenerateConfirm = true
-                            } else {
-                                onGenerateKeyPair()
-                            }
-                        },
+                        onClick = { showGenerateDialog = true },
                         modifier = Modifier
                             .fillMaxWidth()
                             .testTag("generate_keypair_button")
                     ) {
-                        Text(if (metadata.hasKeyPair) "توليد زوج مفاتيح جديد (استبدال)" else "توليد زوج مفاتيح ECDSA P-256 جديد")
+                        Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            if (metadata.hasKeyPair) {
+                                "إنشاء وتدوير إلى مفتاح جديد (${metadata.suggestedNextKid})"
+                            } else {
+                                "توليد أول زوج مفاتيح ECDSA P-256 (${metadata.suggestedNextKid})"
+                            }
+                        )
+                    }
+
+                    if (metadata.keys.isNotEmpty()) {
+                        Text(
+                            text = "المفاتيح المحفوظة في الخزنة (${metadata.keys.size}):",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        metadata.keys.asReversed().forEach { keyItem ->
+                            KeyringEntryItemCard(
+                                key = keyItem,
+                                onSetActive = { onSetActiveKey(keyItem.kid) },
+                                onSetTrusted = { trusted -> onSetKeyTrustedInKeyring(keyItem.kid, trusted) },
+                                onCopySinglePem = {
+                                    LicenseShareHelper.copyToClipboard(
+                                        context,
+                                        "${keyItem.kid} Public PEM",
+                                        keyItem.publicKeyPem
+                                    )
+                                    Toast.makeText(context, "تم نسخ ${keyItem.kid}.pem", Toast.LENGTH_SHORT).show()
+                                },
+                                onShareNamedPem = {
+                                    LicenseShareHelper.sharePublicKeyPemFile(
+                                        context = context,
+                                        publicKeyPem = keyItem.publicKeyPem,
+                                        fileName = "${keyItem.kid}.pem"
+                                    )
+                                },
+                                onSaveNamedPem = {
+                                    val fileName = "${keyItem.kid}.pem"
+                                    pendingPublicPemToSave = fileName to keyItem.publicKeyPem
+                                    savePublicPemLauncher.launch(fileName)
+                                }
+                            )
+                        }
                     }
 
                     Row(
@@ -406,7 +559,7 @@ fun KeyVaultScreen(
                         ) {
                             Icon(Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(Modifier.width(6.dp))
-                            Text("تصدير نسخة احتياطية مشفرة للمفتاح الخاص (.slkey)")
+                            Text("تصدير نسخة احتياطية مشفرة لكافة المفاتيح (.slkey)")
                         }
                     }
                 }
@@ -508,7 +661,7 @@ fun KeyVaultScreen(
                             color = MaterialTheme.colorScheme.primary
                         )
                         Text(
-                            text = "طبقة مجردة مفصولة تماماً تتيح مستقبلاً ربط وحدة تراخيص الحسابات السحابية (ACCOUNT على Cloudflare Worker) دون أي تعديل على محرك التوقيع المحلي.",
+                            text = "طبقة مجردة مفصولة تماماً تتيح مستقبلاً ربط وحدة تراخيص الحسابات السحابية دون أي تعديل على محرك التوقيع المحلي.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -520,39 +673,26 @@ fun KeyVaultScreen(
         }
     }
 
-    if (showGenerateConfirm) {
-        AlertDialog(
-            onDismissRequest = { showGenerateConfirm = false },
-            title = { Text("تحذير استبدال مفتاح التوقيع") },
-            text = {
-                Text(
-                    "يوجد مفتاح توقيع حالي! إذا قمت بتوليد مفتاح جديد، فلن يقبل تطبيق الدفتر الذكي التراخيص الجديدة إلا بعد تحديث ملف license_local_ec_public.pem داخله. تأكد من أخذ نسخة احتياطية مشفرة أولاً."
-                )
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        showGenerateConfirm = false
-                        onGenerateKeyPair()
-                    }
-                ) {
-                    Text("توليد واستبدال")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showGenerateConfirm = false }) {
-                    Text("إلغاء")
-                }
+    if (showGenerateDialog) {
+        GenerateRotateKeyDialog(
+            hasExistingKey = metadata.hasKeyPair,
+            suggestedKid = metadata.suggestedNextKid,
+            existingKids = metadata.keys.map { it.kid }.toSet(),
+            onDismiss = { showGenerateDialog = false },
+            onConfirm = { requestedKid ->
+                showGenerateDialog = false
+                onGenerateKeyPair(requestedKid)
             }
         )
     }
 
     if (showImportPemDialog) {
         ImportPemKeyDialog(
-            hasExistingKey = metadata.hasKeyPair,
+            suggestedKid = metadata.suggestedNextKid,
+            existingKids = metadata.keys.map { it.kid }.toSet(),
             onDismiss = { showImportPemDialog = false },
-            onConfirm = { privPem, pubPem, allowOverwrite ->
-                if (onImportKeyPairPem(privPem, pubPem, allowOverwrite)) {
+            onConfirm = { privPem, pubPem, allowOverwrite, kid ->
+                if (onImportKeyPairPem(privPem, pubPem, allowOverwrite, kid)) {
                     showImportPemDialog = false
                 }
             }
@@ -561,8 +701,8 @@ fun KeyVaultScreen(
 
     if (showExportKeyBackupDialog) {
         PasswordBackupDialog(
-            title = "تصدير نسخة مشفرة للمفتاح الخاص",
-            subtitle = "أدخل كلمة مرور قوية لتشفير المفتاح الخاص والعام بخوارزمية AES-256-GCM + PBKDF2. احفظ الملف في مكان آمن جداً.",
+            title = "تصدير نسخة مشفرة لكافة مفاتيح الخزنة",
+            subtitle = "أدخل كلمة مرور قوية لتشفير جميع المفاتيح الخاصة والعامة (Keyring) بخوارزمية AES-256-GCM + PBKDF2.",
             confirmPasswordRequired = true,
             confirmButtonLabel = "تشفير وحفظ (.slkey)",
             onDismiss = { showExportKeyBackupDialog = false },
@@ -572,7 +712,7 @@ fun KeyVaultScreen(
                     onExportEncryptedKeyBackup(password)
                         .onSuccess { envelope ->
                             pendingKeyBackupContent = envelope
-                            saveKeyBackupLauncher.launch("smartledger_ec_private_backup.slkey")
+                            saveKeyBackupLauncher.launch("smartledger_keyring_backup.slkey")
                         }
                         .onFailure { err ->
                             Toast.makeText(context, err.message ?: "فشل التشفير", Toast.LENGTH_LONG).show()
@@ -584,8 +724,8 @@ fun KeyVaultScreen(
 
     pendingRestoreKeyJson?.let { envelopeJson ->
         PasswordBackupDialog(
-            title = "استعادة المفتاح الخاص من نسخة مشفرة",
-            subtitle = "أدخل كلمة المرور لفك تشفير ملف .slkey واستعادة زوج المفاتيح إلى الخزنة.",
+            title = "استعادة المفاتيح من نسخة مشفرة",
+            subtitle = "أدخل كلمة المرور لفك تشفير ملف .slkey واستعادة سجل المفاتيح بالكامل إلى الخزنة.",
             confirmPasswordRequired = false,
             confirmButtonLabel = "فك التشفير والاستعادة",
             onDismiss = { pendingRestoreKeyJson = null },
@@ -594,7 +734,7 @@ fun KeyVaultScreen(
                 scope.launch {
                     onRestoreEncryptedKeyBackup(envelopeJson, password, true)
                         .onSuccess {
-                            Toast.makeText(context, "تمت استعادة زوج المفاتيح بنجاح", Toast.LENGTH_LONG).show()
+                            Toast.makeText(context, "تمت استعادة سجل المفاتيح بنجاح", Toast.LENGTH_LONG).show()
                         }
                         .onFailure { err ->
                             Toast.makeText(
@@ -618,119 +758,4 @@ fun KeyVaultScreen(
             }
         )
     }
-}
-
-@Composable
-private fun ImportPemKeyDialog(
-    hasExistingKey: Boolean,
-    onDismiss: () -> Unit,
-    onConfirm: (privPem: String, pubPem: String, allowOverwrite: Boolean) -> Unit
-) {
-    var privText by remember { mutableStateOf("") }
-    var pubText by remember { mutableStateOf("") }
-    var allowOverwrite by remember { mutableStateOf(!hasExistingKey) }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("استيراد زوج مفاتيح ECDSA P-256") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(
-                    text = "الصق المفتاح الخاص (PKCS#8 PEM أو Base64) والمفتاح العام المطابق (X.509 PEM):",
-                    style = MaterialTheme.typography.bodySmall
-                )
-                CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
-                    OutlinedTextField(
-                        value = privText,
-                        onValueChange = { privText = it },
-                        label = { Text("Private Key (PKCS#8 PEM / Base64)") },
-                        maxLines = 4,
-                        textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = CryptoMonoFamily),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    OutlinedTextField(
-                        value = pubText,
-                        onValueChange = { pubText = it },
-                        label = { Text("Public Key (-----BEGIN PUBLIC KEY-----)") },
-                        maxLines = 4,
-                        textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = CryptoMonoFamily),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
-                if (hasExistingKey) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Checkbox(checked = allowOverwrite, onCheckedChange = { allowOverwrite = it })
-                        Text("أؤكد استبدال المفتاح الحالي", style = MaterialTheme.typography.bodySmall)
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick = { onConfirm(privText, pubText, allowOverwrite) },
-                enabled = privText.isNotBlank() && pubText.isNotBlank() && (!hasExistingKey || allowOverwrite)
-            ) {
-                Text("استيراد")
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("إلغاء") }
-        }
-    )
-}
-
-@Composable
-private fun ChangePinDialog(
-    onDismiss: () -> Unit,
-    onConfirm: (currentPin: String, newPin: String) -> Unit
-) {
-    var currentPin by remember { mutableStateOf("") }
-    var newPin by remember { mutableStateOf("") }
-    var error by remember { mutableStateOf<String?>(null) }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("تغيير رمز PIN") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedTextField(
-                    value = currentPin,
-                    onValueChange = { currentPin = it.filter(Char::isDigit).take(8); error = null },
-                    label = { Text("رمز PIN الحالي") },
-                    visualTransformation = PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = newPin,
-                    onValueChange = { newPin = it.filter(Char::isDigit).take(8); error = null },
-                    label = { Text("رمز PIN الجديد (4-8 أرقام)") },
-                    visualTransformation = PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                if (error != null) {
-                    Text(error!!, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-                }
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick = {
-                    if (newPin.length !in 4..8) {
-                        error = "الرمز الجديد يجب أن يكون من 4 إلى 8 أرقام"
-                    } else {
-                        onConfirm(currentPin, newPin)
-                    }
-                }
-            ) {
-                Text("حفظ")
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("إلغاء") }
-        }
-    )
 }

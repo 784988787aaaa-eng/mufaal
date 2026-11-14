@@ -22,6 +22,7 @@ import com.example.data.IssuedLicenseEntity
 import com.example.data.LicenseRepository
 import com.example.security.InMemoryVaultStorage
 import com.example.security.KeyVault
+import com.example.share.LicenseShareHelper
 import com.example.ui.SmartLedgerApp
 import com.example.ui.viewmodel.LicenseStudioViewModel
 import kotlinx.coroutines.flow.first
@@ -69,10 +70,11 @@ class ExampleRobolectricTest {
             .build()
         val repo1 = LicenseRepository(db1.issuedLicenseDao())
 
-        val deviceCode = DeviceCodeValidator.buildValidCode("TEST1234567")
+        val deviceCode = DeviceCodeValidator.buildValidCode("TEST2345678")
         val pair = EcLicenseCrypto.generateEcP256KeyPair()
         val payload = EcLicenseCrypto.buildPayload(deviceCode, LicensePlan.TRIAL, trialDays = 14)
         val signed = EcLicenseCrypto.issueAndSign(payload, pair.private, pair.public)
+        assertEquals("license_${deviceCode}.slic", LicenseShareHelper.slicFileName(deviceCode))
 
         val record = IssuedLicenseEntity(
             licenseId = signed.payload.licenseId,
@@ -168,8 +170,8 @@ class ExampleRobolectricTest {
             viewModel.vaultMetadata.value.hasKeyPair
         )
 
-        // 3) Enter a valid device code and issue LIFETIME license
-        val validCode = DeviceCodeValidator.buildValidCode("A1B2C3D4E5F")
+        // 3) Enter a valid 32-char device code and issue LIFETIME license
+        val validCode = DeviceCodeValidator.buildValidCode("A2B3C4D5E6F")
         composeRule.onNodeWithTag("device_code_input").performScrollTo().performTextInput(validCode)
         composeRule.onNodeWithTag("customer_name_input").performScrollTo().performTextInput("شركة النور")
         composeRule.waitForIdle()

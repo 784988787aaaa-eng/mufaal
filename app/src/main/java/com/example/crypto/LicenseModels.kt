@@ -2,7 +2,6 @@ package com.example.crypto
 
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 
@@ -19,42 +18,39 @@ enum class LicensePlan(val wireName: String, val arabicLabel: String) {
 
 @Serializable
 data class LicensePayload(
-    val v: Int = 2,
+    val v: Int = 1,
     val kid: String = "LOCAL2",
-    val alg: String = "ES256",
     val product: String = "SMARTLEDGER",
     val type: String = "LOCAL",
-    val plan: String,
     val licenseId: String,
     val deviceCode: String,
+    val plan: String,
     val iat: Long,
     val trialEndsAt: Long? = null,
-    val customerHint: String? = null
+    val maxDevices: Int = 1,
+    val active: Boolean = true,
+    val revoked: Boolean? = null
 ) {
     /**
-     * Serializes strictly according to SmartLedger v2 local license JSON contract.
-     * `trialEndsAt` is ALWAYS explicitly emitted (even when `null`).
-     * `customerHint` is omitted unless explicitly provided.
+     * Serializes strictly to compact JSON matching SmartLedger's SLK1 local license schema.
+     * - `trialEndsAt` is emitted ONLY when `plan == "TRIAL"` (omitted for `LIFETIME`).
+     * - `revoked` is never emitted during issuance.
      */
     fun toCanonicalJson(): String {
         val obj: JsonObject = buildJsonObject {
             put("v", v)
             put("kid", kid)
-            put("alg", alg)
             put("product", product)
             put("type", type)
-            put("plan", plan)
             put("licenseId", licenseId)
             put("deviceCode", deviceCode)
+            put("plan", plan)
             put("iat", iat)
-            if (trialEndsAt != null) {
+            if (plan == LicensePlan.TRIAL.wireName && trialEndsAt != null) {
                 put("trialEndsAt", trialEndsAt)
-            } else {
-                put("trialEndsAt", JsonPrimitive(null as String?))
             }
-            if (!customerHint.isNullOrBlank()) {
-                put("customerHint", customerHint.trim())
-            }
+            put("maxDevices", maxDevices)
+            put("active", active)
         }
         return obj.toString()
     }
